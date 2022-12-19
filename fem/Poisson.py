@@ -1,148 +1,154 @@
 import torch
 import torch.nn as nn
-from ..mesh import *
-
-
-def quadpts(order=2):
-    '''
-    ported from iFEM's quadpts
-    '''
-
-    if order == 1:     # Order 1, nQuad 1
-        baryCoords = [1/3, 1/3, 1/3]
-        weight = 1
-    elif order == 2:    # Order 2, nQuad 3
-        baryCoords = [[2/3, 1/6, 1/6],
-                      [1/6, 2/3, 1/6],
-                      [1/6, 1/6, 2/3]]
-        weight = [1/3, 1/3, 1/3]
-    elif order == 3:     # Order 3, nQuad 4
-        baryCoords = [[1/3, 1/3, 1/3],
-                      [0.6, 0.2, 0.2],
-                      [0.2, 0.6, 0.2],
-                      [0.2, 0.2, 0.6]]
-        weight = [-27/48, 25/48, 25/48, 25/48]
-    elif order == 4:     # Order 4, nQuad 6
-        baryCoords = [[0.108103018168070, 0.445948490915965, 0.445948490915965],
-                      [0.445948490915965, 0.108103018168070, 0.445948490915965],
-                      [0.445948490915965, 0.445948490915965, 0.108103018168070],
-                      [0.816847572980459, 0.091576213509771, 0.091576213509771],
-                      [0.091576213509771, 0.816847572980459, 0.091576213509771],
-                      [0.091576213509771, 0.091576213509771, 0.816847572980459], ]
-        weight = [0.223381589678011, 0.223381589678011, 0.223381589678011,
-                  0.109951743655322, 0.109951743655322, 0.109951743655322]
-    return torch.Tensor(baryCoords), torch.Tensor(weight)
-
-class DataSinCos:
-    '''
-    Trigonometric data for Poisson equation
-
-        f = 2*pi^2*np.cos(pi*x)*np.cos(pi*y);
-        u = cos(pi*x)*np.cos(pi*y);
-        Du = (-pi*np.sin(pi*x)*np.cos(pi*y), -pi*np.cos(pi*x)*np.sin(pi*y));
-
-    The u satisfies the zero flux condition du/dn = 0 on boundary of [0,1]^2
-    and thus g_N is not assigned.
-    
-    Ported from Long Chen's iFEM package to Python
-    '''
-    def __init__(self):
-        self.pi = torch.tensor(np.pi, dtype=float)
-
-    def f(self, p):
-        x = p[:,0]; y = p[:,1]
-        return 2*self.pi**2*np.cos(self.pi*x)*np.cos(self.pi*y)
-
-    def exactu(self, p):
-        x = p[:,0]; y = p[:,1]
-        return np.cos(self.pi*x)*np.cos(self.pi*y)
-    
-    def g_D(self,p):
-        return self.exactu(p)
-    
-    def Du(self,p):
-        x = p[:,0]; y = p[:,1]
-        Dux = -self.pi*torch.sin(self.pi*x)*torch.cos(self.pi*y)
-        Duy = -self.pi*torch.cos(self.pi*x)*torch.sin(self.pi*y)
-        return torch.stack([Dux, Duy], dim=-1)
-
-    def d(self,p):
-        return torch.ones(p.shape[0], dtype=float)
-
+import torch.nn.functional as F
+from .mesh2d import *
 
 class Poisson(nn.Module):
-    '''
-    A lightweight port of the Poisson
-    from Long Chen's iFEM library
+    """
+    A lightweight Poisson equation solver
 
-    Linear Lagrange element on triangulations
-    '''
-    def __init__(self) -> None:
+    - Linear Lagrange element on triangulations
+
+    Reference: Long Chen's iFEM library
+    https://github.com/lyc102/ifem/blob/master/equation/Poisson.m
+    """
+
+    def __init__(
+        self,
+        domain=((0, 1), (0, 1)),
+        h=1 / 4,
+        quadrature_order=1,
+        dtype: torch.dtype = torch.float64,
+    ) -> None:
         super().__init__()
-        self.quadpts = quadpts()
+        # self.quadpts = quadpts
+        self.domain = domain
+        self.h = h
+        self.mesh_size = int(1/h)+1
+        self.quadrature = quadpts(order=quadrature_order, dtype=dtype)
+        self.dtype = dtype
+        self._initialize()
 
-    def forward(self, pde, mesh: TriMesh2D) -> torch.Tensor:
-        node = mesh.node
-        elem = mesh.elem
-        isBdNode = mesh.isBdNode
-        Dphi = mesh.Dlambda
-        area = mesh.area
+    def _initialize(self) -> None:
+        # TODO update default TriMesh2D options (done)
 
-        N = len(node)
-        NT = len(elem)
+        node, elem = rectangleMesh(
+            x_range=self.domain[0], y_range=self.domain[1], h=self.h
+        )
+        self.trimesh = TriMesh2D(node, elem, dtype=self.dtype)
+        # TODO set u to be parameters (done)
+        self.freeNode = freeNode = self.trimesh.freeNode
+        self.nDof = nDof = int(freeNode.sum())
+        self.nNode = nNode = node.size(0)
+        self.nElem = elem.size(0)
 
-        phi, weight = self.quadpts
-        nQuad = len(phi)
+        self.register_parameter(
+            "u", nn.Parameter(torch.zeros((nDof, 1), dtype=self.dtype))
+        )
+        nn.init.zeros_(self.u)
+        self.register_buffer("uh", torch.zeros((nNode, 1), dtype=self.dtype))
 
-        # diffusion coeff
-        K = torch.zeros(NT)
-        for p in range(nQuad):
-            # quadrature points in the x-y coordinate
-            pxy = phi[p,0]*node[elem[:,0]] + phi[p,1]*node[elem[:,1]] + phi[p,2]*node[elem[:,2]]
-            K += weight[p]*pde.d(pxy)
+    def _assemble(self, pde):
+        node = self.trimesh.node
+        elem = self.trimesh.elem
+        gradPhi = self.trimesh.gradLambda
+        area = self.trimesh.area
+        nElem = self.nElem
+        nNode = self.nNode
 
-        # stiffness matrix
-        A = torch.sparse_coo_tensor(size=(N, N))
-        for i in range(3):
-            for j in range(3):
-                # $A_{ij}|_{\tau} = \int_{\tau}K\nabla \phi_i\cdot \nabla \phi_j dxdy$ 
-                Aij = area*K*(Dphi[...,i]*Dphi[...,j]).sum(axis=-1)
-                A += torch.sparse_coo_tensor([elem[:,i],elem[:,j]], Aij, (N,N))     
+        phi, weight = self.quadrature
+
+        # quadrature points
+        quadPts = torch.einsum("qp, npd->qnd", phi, node[elem])
+
+        # diffusion coefficient
+        Kp = torch.stack([pde.diffusion_coeff(p) for p in quadPts], dim=0)
+        K = torch.einsum("q, qn->n", weight, Kp)
+
+        intgradPhiAgradPhi = torch.einsum(
+            "n,n,ndi,ndj->nij", K, area, gradPhi, gradPhi)
+
+        I = elem[:, :, None].expand_as(intgradPhiAgradPhi)
+        J = elem[:, None, :].expand_as(intgradPhiAgradPhi)
+        IJ = torch.stack([I, J])
+        A = torch.sparse_coo_tensor(
+            IJ.view(2, -1),
+            intgradPhiAgradPhi.contiguous().view(-1),
+            size=(nNode, nNode),
+        )
 
         # right hand side
-        b = torch.zeros(N)
-        bt = torch.zeros((NT,3))
+        b = torch.zeros((nNode, 1), dtype=self.dtype)
 
-        for p in range(nQuad):
-            # quadrature points in the x-y coordinate
-            pxy = phi[p,0]*node[elem[:,0]] + phi[p,1]*node[elem[:,1]] + phi[p,2]*node[elem[:,2]]
-            fp = pde.f(pxy)
-            for i in range(3):
-                bt[:,i] += weight[p]*phi[p,i]*fp
+        if callable(pde.source):
+            fK = torch.stack([pde.source(p) for p in quadPts], dim=0)
+            bt = torch.einsum("q, qn, qp, n->np", weight, fK, phi, area)
+        elif torch.is_tensor(pde.source):
+            
+            if pde.source.size(-1) == 1:  # (bsz, nNode, 1)
+                pass
+            else:  # (bsz, n, n)
+                f =  F.interpolate(pde.source,
+                                  size=(self.mesh_size+1, self.mesh_size+1),
+                                    mode='bilinear',
+                                    align_corners=True)
+                fK = f.view(-1)[elem].mean(-1)
+                bt = torch.einsum("q, n, qp, n->np", weight, fK, phi, area)
 
-        bt *= area.reshape(-1,1)
-        b = torch.bincount(elem.view(-1), weights=bt.view(-1))
+        b.scatter_(0, index=elem.view(-1, 1), src=bt.view(-1, 1), reduce="add")
 
-        # Dirichlet
-        u = torch.zeros(N)
-        u[isBdNode] = pde.g_D(node[isBdNode])
-        b -= A.dot(u) 
+        isBdNode = self.trimesh.isBdNode
+        freeNode = self.trimesh.freeNode
 
-        # Direct solve
-        freeNode = ~isBdNode
-        u[freeNode] = torch.solve(A[freeNode,:][:,freeNode], b[freeNode])
+        self.uh.scatter_(
+            0,
+            index=torch.where(isBdNode)[0].unsqueeze(-1),
+            src=pde.g_D(node[isBdNode]).unsqueeze(-1),
+        )
+        b -= torch.sparse.mm(A, self.uh)
 
-        # compute Du
-        dudx =  (u[elem]*Dphi[:,0,:]).sum(axis=-1)
-        dudy =  (u[elem]*Dphi[:,1,:]).sum(axis=-1)      
-        Du = torch.stack([dudx, dudy], dim=-1)
+        self.A = A
+        self.b = b
 
-        soln = {'u': u,
-                'Du': Du}
-        eqn = {'A': A,
-            'b': b,
-            'freeNode': freeNode}
+        A = A.to_dense()
+        maskFreeNode = torch.outer(freeNode, freeNode)
+        nDof = self.nDof
+        A_int = A[maskFreeNode].view(nDof, nDof).to_sparse()
+        A_int = A_int.coalesce()
+        b_int = b[freeNode]
+        self.b_int = b_int
+        self.A_int = A_int
 
-        return soln, eqn
-   
-    
+    def forward(self, u):
+        return torch.sparse.mm(self.A_int, u)
+
+    def solve(self, f=None) -> None:
+        """
+        direct solver, not working in sparse only
+        """
+        freeNode = self.trimesh.freeNode
+
+        if self.A.is_sparse:
+            A = self.A.to_dense()
+        else:
+            A = self.A.copy()
+        b = self.b if f is None else f
+
+        self.u.detach_()
+        self.u = nn.Parameter(
+            torch.linalg.solve(A[freeNode, :][:, freeNode], b[freeNode])
+        )
+
+    def get_u(self):
+        """
+        assemble u and u_g back into 1
+        """
+        self.uh[self.trimesh.freeNode] = self.u.detach()
+        return self.uh.squeeze()
+
+    def energy(self, u, b):
+        """
+        0.5*u^T A u - f*u
+        """
+        Au = self.forward(u)
+        return 0.5 * (u.T).mm(Au) - (b.T).mm(u)
