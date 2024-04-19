@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-  name = 'torch-fem',
-  packages=find_packages(include=['torch_fem', 'torch_fem.*']),
-  version = '0.2.1',
+  name = 'torch-afem',
+  packages=find_packages(include=['torch_afem', 'torch_afem.*']),
+  version = '0.0.1',
   license='MIT',
   description = 'PyTorch Finite Element Method',
   long_description='PyTorch Finite Element Method',
